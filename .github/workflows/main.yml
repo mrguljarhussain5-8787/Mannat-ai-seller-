@@ -1,0 +1,194 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed only for the Release step
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout existing code
+        uses: actions/checkout@v4
+
+      - name: Inspect repository (read-only)
+        id: detect
+        shell: bash
+        run: |
+          set +e; set +o pipefail
+          echo "---- Top-level files ----"; ls -la
+
+          # 1) Application module = build file that applies the Android application plugin
+          MODULE_DIR=""
+          for f in $(find . -maxdepth 3 \( -name build.gradle -o -name build.gradle.kts \) -not -path "./.git/*" -not -path "*/buildSrc/*" | sort); do
+            if grep -E 'android[.-]application' "$f" | grep -vq 'apply false'; then
+              MODULE_DIR=$(dirname "$f"); break
+            fi
+          done
+          if [ -z "$MODULE_DIR" ]; then
+            echo "::error::No Android application module found. Nothing was created or changed."
+            exit 1
+          fi
+          MODBUILD=$(ls "$MODULE_DIR"/build.gradle.kts "$MODULE_DIR"/build.gradle 2>/dev/null | awk 'NR==1')
+          if [ "$MODULE_DIR" = "." ]; then MOD_PATH=""; else MOD_PATH=$(echo "${MODULE_DIR#./}" | tr '/' ':'); fi
+
+          # 2) MainActivity + package + applicationId + versionName
+          MAIN=$(find "$MODULE_DIR/src" \( -name 'MainActivity.kt' -o -name 'MainActivity.java' \) 2>/dev/null | awk 'NR==1')
+          PKG=""; [ -n "$MAIN" ] && PKG=$(grep -E '^package ' "$MAIN" | awk 'NR==1{print $2}' | tr -d ';')
+          APPID=$(grep -hoE 'applicationId *=? *"[^"]+"' "$MODBUILD" | awk 'NR==1' | grep -oE '"[^"]+"' | tr -d '"')
+          VERSION=$(grep -hoE 'versionName *=? *"[^"]+"' "$MODBUILD" | awk 'NR==1' | grep -oE '"[^"]+"' | tr -d '"')
+          [ -z "$VERSION" ] && VERSION="1.0"
+
+          # 3) Android Gradle Plugin: read it, never guess
+          AGP=$(grep -rhE 'com\.android\.(application|tools\.build:gradle)' --include=*.gradle --include=*.kts . 2>/dev/null \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | awk 'NR==1')
+          if [ -z "$AGP" ] && [ -f gradle/libs.versions.toml ]; then
+            AGP=$(grep -E '^agp *=' gradle/libs.versions.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | awk 'NR==1')
+          fi
+          if [ -z "$AGP" ]; then
+            echo "::error::Could not read the Android Gradle Plugin version from your build files."
+            exit 1
+          fi
+          AGP_MM=$(echo "$AGP" | cut -d. -f1,2); AGP_MAJOR=$(echo "$AGP" | cut -d. -f1)
+
+          # 4) Gradle: use the project's own wrapper if complete; otherwise the minimum
+          #    version that AGP officially requires (fail if unknown, no guessing)
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ] && [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+            GRADLE="wrapper"
+            GSHOW="project wrapper ($(grep distributionUrl gradle/wrapper/gradle-wrapper.properties | sed -E 's/.*gradle-([0-9.]+).*/\1/'))"
+          else
+            case "$AGP_MM" in
+              7.2) GRADLE=7.3.3;; 7.3) GRADLE=7.4;; 7.4) GRADLE=7.5;;
+              8.0|8.1) GRADLE=8.0;; 8.2) GRADLE=8.2;; 8.3) GRADLE=8.4;; 8.4) GRADLE=8.6;;
+              8.5|8.6) GRADLE=8.7;; 8.7) GRADLE=8.9;; 8.8) GRADLE=8.10.2;;
+              8.9|8.10) GRADLE=8.11.1;; 8.11|8.12|8.13) GRADLE=8.13;;
+              *) echo "::error::No Gradle wrapper in repo and AGP $AGP is not in my compatibility table. Add gradle/wrapper files (gradlew, gradle-wrapper.jar and .properties)."; exit 1;;
+            esac
+            GSHOW="$GRADLE (minimum required by AGP $AGP; no complete wrapper in repo)"
+          fi
+
+          # 5) Java: minimum required by AGP (7.x -> 11, 8+ -> 17), or higher only if your files ask for it
+          if [ "$AGP_MAJOR" -lt 8 ]; then JAVA=11; else JAVA=17; fi
+          REQ=$(grep -rhoE 'jvmToolchain\([0-9]+\)|JavaLanguageVersion\.of\([0-9]+\)' --include=*.gradle --include=*.kts . 2>/dev/null \
+                | grep -oE '[0-9]+' | sort -n | tail -1)
+          if [ -n "$REQ" ] && [ "$REQ" -gt "$JAVA" ]; then JAVA="$REQ"; fi
+
+          {
+            echo "module_dir=$MODULE_DIR"; echo "module_path=$MOD_PATH"
+            echo "gradle=$GRADLE"; echo "java=$JAVA"; echo "version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Detected project settings"
+            echo "| Item | Value |"; echo "|---|---|"
+            echo "| Application module | \`$MODULE_DIR\` |"
+            echo "| MainActivity | \`${MAIN:-not found}\` (package \`${PKG:-n/a}\`) |"
+            echo "| applicationId | \`${APPID:-n/a}\` |"
+            echo "| Android Gradle Plugin | \`$AGP\` |"
+            echo "| Gradle | $GSHOW |"
+            echo "| Java | \`$JAVA\` |"
+            echo "| versionName | \`$VERSION\` |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.detect.outputs.java }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.detect.outputs.gradle }}
+
+      - name: Build release APK
+        shell: bash
+        env:
+          MOD_PATH: ${{ steps.detect.outputs.module_path }}
+        run: |
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew; CMD=./gradlew
+          else
+            CMD=gradle
+          fi
+          TASK="assembleRelease"; [ -n "$MOD_PATH" ] && TASK=":$MOD_PATH:assembleRelease"
+          echo "Running: $CMD $TASK"
+          $CMD "$TASK" --no-daemon --stacktrace
+
+      - name: Locate APK and verify signing
+        id: verify
+        shell: bash
+        env:
+          MODULE_DIR: ${{ steps.detect.outputs.module_dir }}
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set +e; set +o pipefail
+          DIR="$MODULE_DIR/build/outputs/apk/release"
+          APK=$(find "$DIR" -name '*.apk' ! -name '*unsigned*' 2>/dev/null | awk 'NR==1')
+          [ -z "$APK" ] && APK=$(find "$DIR" -name '*.apk' 2>/dev/null | awk 'NR==1')
+          if [ -z "$APK" ]; then echo "::error::No release APK was produced in $DIR"; exit 1; fi
+
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          BT=$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)
+
+          if "$BT/apksigner" verify "$APK" >/dev/null 2>&1; then
+            echo "APK is signed by the project's own signing config."
+          elif [ -n "$KS_B64" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KS_PASS" ]; then
+            echo "Project did not sign the APK; signing with repository secrets."
+            export KEY_PASS="${KEY_PASS:-$KS_PASS}"
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            "$BT/zipalign" -f -p 4 "$APK" "$RUNNER_TEMP/aligned.apk" || exit 1
+            "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks" --ks-pass env:KS_PASS \
+              --key-alias "$KEY_ALIAS" --key-pass env:KEY_PASS \
+              --out "$RUNNER_TEMP/signed.apk" "$RUNNER_TEMP/aligned.apk" || exit 1
+            APK="$RUNNER_TEMP/signed.apk"
+          else
+            echo "::error::Release APK is UNSIGNED. Add a signingConfig to the release build type, or add secrets KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS (and optionally KEY_PASSWORD)."
+            exit 1
+          fi
+
+          "$BT/apksigner" verify --verbose --print-certs "$APK" > "$RUNNER_TEMP/verify.txt" || { cat "$RUNNER_TEMP/verify.txt"; echo "::error::Signature verification failed"; exit 1; }
+          if grep -qi 'CN=Android Debug' "$RUNNER_TEMP/verify.txt"; then
+            echo "::error::APK is signed with the Android debug key, not a release key."; exit 1
+          fi
+
+          cp "$APK" MannatAISeller.apk
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "### APK signature: VERIFIED"
+            echo '```'
+            grep -E 'Verifies|Number of signers|certificate DN|certificate SHA-256' "$RUNNER_TEMP/verify.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload signed APK as artifact
+        if: steps.verify.outputs.signed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MannatAISeller-apk
+          path: MannatAISeller.apk
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        id: release
+        if: steps.verify.outputs.signed == 'true' && github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.detect.outputs.version }}-build${{ github.run_number }}
+          name: Mannat AI Seller ${{ steps.detect.outputs.version }} (build ${{ github.run_number }})
+          files: MannatAISeller.apk
+          generate_release_notes: true
+          make_latest: true
+
+      - name: Release permission help
+        if: steps.release.outcome == 'failure'
+        run: |
+          echo "::warning::Release was not created, but the signed APK is still in the run's Artifacts."
+          echo "Fix: repo Settings > Actions > General > Workflow permissions > select 'Read and write permissions', then re-run."
